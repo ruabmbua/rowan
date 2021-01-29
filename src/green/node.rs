@@ -138,6 +138,14 @@ impl GreenNodeData {
         });
         GreenNode::new(self.kind(), children)
     }
+    pub(crate) fn remove_child(&self, idx: usize) -> GreenNode {
+        let children = self
+            .children()
+            .enumerate()
+            .filter_map(|(i, child)| if i == idx { None } else { Some(child.cloned()) })
+            .collect::<Vec<_>>();
+        GreenNode::new(self.kind(), children)
+    }
 }
 
 impl ops::Deref for GreenNode {

@@ -1,3 +1,6 @@
+use std::ops::{AddAssign, Sub};
+use text_size::TextSize;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeOrToken<N, T> {
     Node(N),
@@ -147,3 +150,35 @@ macro_rules! _static_assert {
     };
 }
 pub(crate) use _static_assert as static_assert;
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Delta<T> {
+    Add(T),
+    Sub(T),
+}
+
+impl<T: Ord + Sub<Output = T>> Delta<T> {
+    pub(crate) fn new(old: T, new: T) -> Delta<T> {
+        if new > old {
+            Delta::Add(new - old)
+        } else {
+            Delta::Sub(old - new)
+        }
+    }
+}
+
+// This won't be coherent :-(
+// impl<T: AddAssign + SubAssign> AddAssign<Delta<T>> for T
+macro_rules! impls {
+    ($($ty:ident)*) => {$(
+        impl AddAssign<Delta<$ty>> for $ty {
+            fn add_assign(&mut self, rhs: Delta<$ty>) {
+                match rhs {
+                    Delta::Add(amt) => *self += amt,
+                    Delta::Sub(amt) => *self -= amt,
+                }
+            }
+        }
+    )*};
+}
+impls!(u32 TextSize);

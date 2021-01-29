@@ -2,13 +2,17 @@ use std::{
     cell::Cell,
     fmt,
     hash::{Hash, Hasher},
-    iter, mem, ptr, slice,
+    iter,
+    mem::ManuallyDrop,
+    ptr,
 };
 
 use countme::Count;
 
 use crate::{
-    green::{GreenChild, GreenElementRef, GreenNodeData, SyntaxKind},
+    green::{GreenElementRef, GreenNodeData, SyntaxKind},
+    sll,
+    utility_types::Delta,
     Direction, GreenNode, GreenToken, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
     WalkEvent,
 };
@@ -35,30 +39,33 @@ impl Drop for SyntaxNode {
         let rc = self.data().rc.get() - 1;
         self.data().rc.set(rc);
         if rc == 0 {
-            unsafe { free(Box::from_raw(self.ptr.as_ptr())) }
+            unsafe { free(self.ptr) }
         }
     }
 }
 
 #[inline(never)]
-fn free(mut data: Box<NodeData>) {
+unsafe fn free(mut data: ptr::NonNull<NodeData>) {
     loop {
-        debug_assert_eq!(data.rc.get(), 0);
-        match data.parent.take() {
+        debug_assert_eq!(data.as_ref().rc.get(), 0);
+        let node = Box::from_raw(data.as_ptr());
+        match node.parent.take() {
             Some(parent) => {
-                let parent = mem::ManuallyDrop::new(parent);
-                let rc = parent.data().rc.get() - 1;
-                parent.data().rc.set(rc);
+                if node.mutable {
+                    sll::unlink(&parent.as_ref().first, &*node)
+                }
+                let rc = parent.as_ref().rc.get() - 1;
+                parent.as_ref().rc.set(rc);
                 if rc == 0 {
-                    data = unsafe { Box::from_raw(parent.ptr.as_ptr()) }
+                    data = parent;
                 } else {
                     break;
                 }
             }
-            None => unsafe {
-                GreenNode::from_raw(data.green);
+            None => {
+                let _ = GreenNode::from_raw(node.green.get());
                 break;
-            },
+            }
         }
     }
 }
@@ -139,55 +146,177 @@ impl fmt::Display for SyntaxElement {
 }
 
 struct NodeData {
-    rc: Cell<u32>,
-    parent: Option<SyntaxNode>,
-    index: u32,
-    offset: TextSize,
-    green: ptr::NonNull<GreenNodeData>,
     _c: Count<SyntaxNode>,
+    rc: Cell<u32>,
+    parent: Cell<Option<ptr::NonNull<NodeData>>>,
+    index: Cell<u32>,
+    offset: TextSize,
+    green: Cell<ptr::NonNull<GreenNodeData>>,
+
+    mutable: bool,
+    // The following links only have meaning when state is `Mut`.
+    first: Cell<*const NodeData>,
+    // Invariant: never null
+    next: Cell<*const NodeData>,
+    prev: Cell<*const NodeData>,
+}
+
+unsafe impl sll::Elem for NodeData {
+    fn prev(&self) -> &Cell<*const Self> {
+        &self.prev
+    }
+
+    fn next(&self) -> &Cell<*const Self> {
+        &self.next
+    }
+
+    fn key(&self) -> &Cell<u32> {
+        &self.index
+    }
+}
+
+impl NodeData {
+    #[inline]
+    fn new(
+        parent: Option<SyntaxNode>,
+        index: u32,
+        offset: TextSize,
+        green: ptr::NonNull<GreenNodeData>,
+        mutable: bool,
+    ) -> ptr::NonNull<NodeData> {
+        let res = NodeData {
+            _c: Count::new(),
+            rc: Cell::new(1),
+            parent: {
+                let parent = ManuallyDrop::new(parent);
+                Cell::new(parent.as_ref().map(|it| it.ptr))
+            },
+            index: Cell::new(index),
+            offset,
+            green: Cell::new(green),
+
+            mutable,
+            first: Cell::new(ptr::null()),
+            next: Cell::new(ptr::null()),
+            prev: Cell::new(ptr::null()),
+        };
+        unsafe {
+            let mut res = Box::into_raw(Box::new(res));
+            if mutable {
+                if let Err(node) = sll::init((*res).parent().map(|it| &it.first), &*res) {
+                    Box::from_raw(res);
+                    res = node as *mut _;
+                }
+            }
+            ptr::NonNull::new_unchecked(res)
+        }
+    }
+
+    fn to_owned(&self) -> SyntaxNode {
+        let rc = self.rc.get();
+        self.rc.set(rc + 1);
+        SyntaxNode { ptr: ptr::NonNull::from(self) }
+    }
+
+    #[inline]
+    fn parent(&self) -> Option<&NodeData> {
+        self.parent.get().map(|it| unsafe { &*it.as_ptr() })
+    }
+    #[inline]
+    fn green(&self) -> &GreenNodeData {
+        unsafe { &*self.green.get().as_ptr() }
+    }
+    #[inline]
+    fn index(&self) -> u32 {
+        self.index.get()
+    }
+
+    #[inline]
+    fn offset(&self) -> TextSize {
+        if self.mutable {
+            self.offset_mut()
+        } else {
+            self.offset
+        }
+    }
+
+    #[cold]
+    fn offset_mut(&self) -> TextSize {
+        match self.parent() {
+            Some(parent) => {
+                let rel_offset =
+                    parent.green().children().raw.nth(self.index() as usize).unwrap().rel_offset();
+                parent.offset_mut() + rel_offset
+            }
+            None => 0.into(),
+        }
+    }
+
+    fn detach(&self) {
+        assert!(self.mutable);
+        let parent = match self.parent.take() {
+            Some(parent) => parent,
+            None => return,
+        };
+
+        unsafe {
+            sll::adjust(self, self.index() + 1, Delta::Sub(1));
+            let mut node = parent.as_ref();
+            sll::unlink(&node.first, self);
+            let _ = GreenNode::into_raw(self.green().to_owned());
+
+            let mut green = node.green().remove_child(self.index() as usize);
+
+            loop {
+                match node.parent() {
+                    Some(parent) => {
+                        node.green.set((&*green).into());
+                        green = parent.green().replace_child(node.index() as usize, green.into());
+                        node = parent;
+                    }
+                    None => {
+                        let _ = GreenNode::from_raw(node.green.get());
+                        node.green.set(GreenNode::into_raw(green));
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SyntaxNode {
-    fn new(data: NodeData) -> SyntaxNode {
-        SyntaxNode { ptr: unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(data))) } }
-    }
-
     pub fn new_root(green: GreenNode) -> SyntaxNode {
-        let data = NodeData {
-            rc: Cell::new(1),
-            parent: None,
-            index: 0,
-            offset: 0.into(),
-            green: GreenNode::into_raw(green),
-            _c: Count::new(),
-        };
-        SyntaxNode::new(data)
+        SyntaxNode { ptr: NodeData::new(None, 0, 0.into(), GreenNode::into_raw(green), false) }
     }
 
-    // Technically, unsafe, but private so that's OK.
-    // Safety: `green` must be a descendent of `parent.green()`
+    pub fn new_root_mut(green: GreenNode) -> SyntaxNode {
+        SyntaxNode { ptr: NodeData::new(None, 0, 0.into(), GreenNode::into_raw(green), true) }
+    }
+
     fn new_child(
-        green: &GreenNode,
+        green: &GreenNodeData,
         parent: SyntaxNode,
         index: u32,
         offset: TextSize,
     ) -> SyntaxNode {
-        let data = NodeData {
-            rc: Cell::new(1),
-            parent: Some(parent),
-            index,
-            offset,
-            green: {
-                let green: &GreenNodeData = &*green;
-                ptr::NonNull::from(green)
-            },
-            _c: Count::new(),
-        };
-        SyntaxNode::new(data)
+        let mutable = parent.data().mutable;
+        SyntaxNode { ptr: NodeData::new(Some(parent), index, offset, green.into(), mutable) }
+    }
+
+    pub fn clone_for_update(&self) -> SyntaxNode {
+        assert!(!self.data().mutable);
+        match self.parent() {
+            Some(parent) => {
+                let parent = parent.clone_for_update();
+                SyntaxNode::new_child(self.green_ref(), parent, self.data().index(), self.offset())
+            }
+            None => SyntaxNode::new_root_mut(self.green_ref().to_owned()),
+        }
     }
 
     fn key(&self) -> (ptr::NonNull<GreenNodeData>, TextSize) {
-        (self.data().green, self.offset())
+        (self.data().green.get(), self.offset())
     }
 
     #[inline]
@@ -197,11 +326,12 @@ impl SyntaxNode {
 
     pub fn replace_with(&self, replacement: GreenNode) -> GreenNode {
         assert_eq!(self.kind(), replacement.kind());
-        match &self.data().parent {
+        match &self.parent() {
             None => replacement,
             Some(parent) => {
-                let new_parent =
-                    parent.green().replace_child(self.data().index as usize, replacement.into());
+                let new_parent = parent
+                    .green_ref()
+                    .replace_child(self.data().index() as usize, replacement.into());
                 parent.replace_with(new_parent)
             }
         }
@@ -209,18 +339,18 @@ impl SyntaxNode {
 
     #[inline]
     pub fn kind(&self) -> SyntaxKind {
-        self.green().kind()
+        self.green_ref().kind()
     }
 
     #[inline]
     fn offset(&self) -> TextSize {
-        self.data().offset
+        self.data().offset()
     }
 
     #[inline]
     pub fn text_range(&self) -> TextRange {
         let offset = self.offset();
-        let len = self.green().text_len();
+        let len = self.green_ref().text_len();
         TextRange::at(offset, len)
     }
 
@@ -230,13 +360,17 @@ impl SyntaxNode {
     }
 
     #[inline]
-    pub fn green(&self) -> &GreenNodeData {
-        unsafe { self.data().green.as_ref() }
+    pub fn green(&self) -> GreenNode {
+        self.green_ref().to_owned()
+    }
+    #[inline]
+    fn green_ref(&self) -> &GreenNodeData {
+        self.data().green()
     }
 
     #[inline]
     pub fn parent(&self) -> Option<SyntaxNode> {
-        self.data().parent.clone()
+        self.data().parent().map(|it| it.to_owned())
     }
 
     #[inline]
@@ -255,7 +389,7 @@ impl SyntaxNode {
     }
 
     pub fn first_child(&self) -> Option<SyntaxNode> {
-        self.green().children().raw.enumerate().find_map(|(index, child)| {
+        self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
             child.as_ref().into_node().map(|green| {
                 SyntaxNode::new_child(
                     green,
@@ -267,7 +401,7 @@ impl SyntaxNode {
         })
     }
     pub fn last_child(&self) -> Option<SyntaxNode> {
-        self.green().children().raw.enumerate().rev().find_map(|(index, child)| {
+        self.green_ref().children().raw.enumerate().rev().find_map(|(index, child)| {
             child.as_ref().into_node().map(|green| {
                 SyntaxNode::new_child(
                     green,
@@ -280,12 +414,12 @@ impl SyntaxNode {
     }
 
     pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green().children().raw.next().map(|child| {
+        self.green_ref().children().raw.next().map(|child| {
             SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset() + child.rel_offset())
         })
     }
     pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
-        self.green().children().raw.enumerate().next_back().map(|(index, child)| {
+        self.green_ref().children().raw.enumerate().next_back().map(|(index, child)| {
             SyntaxElement::new(
                 child.as_ref(),
                 self.clone(),
@@ -296,14 +430,14 @@ impl SyntaxNode {
     }
 
     pub fn next_sibling(&self) -> Option<SyntaxNode> {
-        let parent = self.data().parent.as_ref()?;
+        let parent = self.data().parent()?;
         let mut children = parent.green().children().raw.enumerate();
-        children.nth(self.data().index as usize);
+        children.nth(self.data().index() as usize);
         children.find_map(|(index, child)| {
             child.as_ref().into_node().map(|green| {
                 SyntaxNode::new_child(
                     green,
-                    parent.clone(),
+                    parent.to_owned(),
                     index as u32,
                     parent.offset() + child.rel_offset(),
                 )
@@ -311,14 +445,14 @@ impl SyntaxNode {
         })
     }
     pub fn prev_sibling(&self) -> Option<SyntaxNode> {
-        let parent = self.data().parent.as_ref()?;
+        let parent = self.data().parent()?;
         let mut children = parent.green().children().raw.enumerate().rev();
-        children.nth(parent.green().children().len() - self.data().index as usize);
+        children.nth(parent.green().children().len() - self.data().index() as usize);
         children.find_map(|(index, child)| {
             child.as_ref().into_node().map(|green| {
                 SyntaxNode::new_child(
                     green,
-                    parent.clone(),
+                    parent.to_owned(),
                     index as u32,
                     parent.offset() + child.rel_offset(),
                 )
@@ -327,12 +461,12 @@ impl SyntaxNode {
     }
 
     pub fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-        let parent = self.data().parent.as_ref()?;
-        parent.green().children().raw.enumerate().nth(self.data().index as usize + 1).map(
+        let parent = self.data().parent()?;
+        parent.green().children().raw.enumerate().nth(self.data().index() as usize + 1).map(
             |(index, child)| {
                 SyntaxElement::new(
                     child.as_ref(),
-                    parent.clone(),
+                    parent.to_owned(),
                     index as u32,
                     parent.offset() + child.rel_offset(),
                 )
@@ -340,17 +474,17 @@ impl SyntaxNode {
         )
     }
     pub fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-        let parent = self.data().parent.as_ref()?;
+        let parent = self.data().parent()?;
         parent
             .green()
             .children()
             .raw
             .enumerate()
-            .nth(self.data().index.checked_sub(1)? as usize)
+            .nth(self.data().index().checked_sub(1)? as usize)
             .map(|(index, child)| {
                 SyntaxElement::new(
                     child.as_ref(),
-                    parent.clone(),
+                    parent.to_owned(),
                     index as u32,
                     parent.offset() + child.rel_offset(),
                 )
@@ -489,9 +623,13 @@ impl SyntaxNode {
 
     pub fn child_or_token_at_range(&self, range: TextRange) -> Option<SyntaxElement> {
         let rel_range = range - self.offset();
-        self.green().child_at_range(rel_range).map(|(index, rel_offset, green)| {
+        self.green_ref().child_at_range(rel_range).map(|(index, rel_offset, green)| {
             SyntaxElement::new(green, self.clone(), index as u32, self.offset() + rel_offset)
         })
+    }
+
+    pub fn detach(&self) {
+        self.data().detach()
     }
 }
 
@@ -506,7 +644,7 @@ impl SyntaxToken {
         let parent = self.parent();
         let me = self.index;
 
-        let children = parent.green().children().enumerate().map(|(i, child)| {
+        let children = parent.green_ref().children().enumerate().map(|(i, child)| {
             if i as u32 == me {
                 replacement.take().unwrap().into()
             } else {
@@ -534,7 +672,7 @@ impl SyntaxToken {
 
     #[inline]
     pub fn green(&self) -> &GreenToken {
-        self.parent.green().children().nth(self.index as usize).unwrap().as_token().unwrap()
+        self.parent.green_ref().children().nth(self.index as usize).unwrap().as_token().unwrap()
     }
 
     #[inline]
@@ -548,7 +686,7 @@ impl SyntaxToken {
     }
 
     pub fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-        self.parent.green().children().raw.enumerate().nth((self.index + 1) as usize).map(
+        self.parent.green_ref().children().raw.enumerate().nth((self.index + 1) as usize).map(
             |(index, child)| {
                 SyntaxElement::new(
                     child.as_ref(),
@@ -560,16 +698,20 @@ impl SyntaxToken {
         )
     }
     pub fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-        self.parent.green().children().raw.enumerate().nth(self.index.checked_sub(1)? as usize).map(
-            |(index, child)| {
+        self.parent
+            .green_ref()
+            .children()
+            .raw
+            .enumerate()
+            .nth(self.index.checked_sub(1)? as usize)
+            .map(|(index, child)| {
                 SyntaxElement::new(
                     child.as_ref(),
                     self.parent(),
                     index as u32,
                     self.parent.offset() + child.rel_offset(),
                 )
-            },
-        )
+            })
     }
 
     pub fn siblings_with_tokens(
